@@ -373,14 +373,27 @@ def handle(p: dict) -> None:
     # 2) filtro volatilita' dell'indicatore: spento di default (M1 e M5 sempre)
     tfrec = (val(p, "tfrec") or "").upper()
     tf_ok = (not FOLLOW_TFREC) or (not tfrec) or tfrec == (tf_raw or "").upper()
+    def skip_zone(why: str):
+        # zona NON pubblicata: la segniamo, cosi' i suoi TP / stop successivi vengono scartati
+        log.info("Scartato %s %s %s %s: %s", ev, symbol, tf_raw, side_in, why)
+        if ev == "ZONE":
+            with state_lock:
+                trades[key] = {"skipped": True, "side": side_in, "open": False, "ts": time.time()}
+                trades.pop(pre_key, None)
+                save_state(trades)
+
     if ev in ("PRE", "ZONE") and not tf_ok:
+        skip_zone(f"timeframe consigliato {tfrec}")
         return
     # 3) un solo setup per direzione sullo stesso simbolo
     if ONE_SIDE and ev in ("PRE", "ZONE"):
         opp = open_opposite(symbol, tf_raw, side_in)
         if opp:
-            log.info("Scartato %s %s %s %s: setup %s ancora aperto (%s)", ev, symbol, tf_raw, side_in, opp.get("side"), opp.get("key"))
+            skip_zone(f"setup {opp.get('side')} ancora aperto ({opp.get('key')})")
             return
+    if ev in ("TP", "SL", "TSL", "CLOSE") and t.get("skipped"):
+        log.info("Scartato %s %s %s: zona %s non pubblicata", ev, symbol, tf_raw, val(p, "id"))
+        return
     # 4) aggiornamento di una zona sconosciuta (non pubblicata o server riavviato)
     if ev in ("TP", "SL", "TSL", "CLOSE") and not t:
         if ev == "TSL" or not tf_ok:
@@ -518,7 +531,7 @@ def recap_data(day: datetime | None = None) -> dict:
     rows = []
     for k, t in items:
         ts = t.get("ts")
-        if not ts:
+        if not ts or t.get("skipped"):
             continue
         born = datetime.fromtimestamp(ts, TZ)
         if born.date() != day.date():
@@ -612,12 +625,39 @@ def worker():
             jobs.task_done()
 
 
+def startup_check():
+    if not TOKEN or not CHAT_ID:
+        log.error("MANCANO TELEGRAM_TOKEN o CHAT_ID nelle variabili di Railway")
+        return
+    me = tg("getMe", {})
+    log.info("Bot Telegram: %s", ("@" + me["username"]) if me else "TOKEN NON VALIDO")
+    chat = tg("getChat", {"chat_id": CHAT_ID})
+    log.info("Gruppo: %s", chat.get("title") if chat else "CHAT_ID errato oppure il bot non e' nel gruppo")
+    if me and chat:
+        m = tg("getChatMember", {"chat_id": CHAT_ID, "user_id": me["id"]})
+        log.info("Ruolo del bot nel gruppo: %s", m.get("status") if m else "?")
+    log.info("Timeframe pubblicati: %s | topic generale %s, M1 %s, M5 %s | chiave webhook %s",
+             sorted(ALLOWED_TF), TOPIC_ID, TOPIC_BY_TF["1"], TOPIC_BY_TF["5"], "impostata" if SECRET else "VUOTA")
+
+
+threading.Thread(target=startup_check, daemon=True).start()
 threading.Thread(target=worker, daemon=True).start()
 if RECAP_TIME.strip():
     threading.Thread(target=recap_scheduler, daemon=True).start()
 
 
 # ---------------------------------------------------------------- endpoint
+@app.get("/stato")
+def stato():
+    """/stato?secret=...  ultime zone ricevute e se sono state pubblicate"""
+    if not _auth():
+        return jsonify(ok=False, error="chiave errata"), 403
+    with state_lock:
+        items = list(trades.items())[-20:]
+    return jsonify(ok=True, ultime=[{"zona": k, "pubblicata": not t.get("skipped"), "aperta": t.get("open"),
+                                     "lato": t.get("side")} for k, t in items])
+
+
 @app.get("/")
 def health():
     return jsonify(ok=True, bot="manufx-m1m5", timeframes=sorted(ALLOWED_TF), topic=TOPIC_ID,
@@ -628,6 +668,7 @@ def health():
 @app.post("/webhook")
 def webhook():
     raw = request.get_data(as_text=True) or ""
+    log.info("Webhook ricevuto: %s", raw[:300].replace(SECRET, "***") if SECRET else raw[:300])
     try:
         data = json.loads(raw)
         items = data if isinstance(data, list) else [data]
@@ -636,6 +677,7 @@ def webhook():
         # l'indicatore manda anche alert di solo testo (breakout, TP ecc.): qui non servono
         return jsonify(ok=True, ignored="non JSON"), 200
     if SECRET and any(p.get("secret") != SECRET for p in items):
+        log.warning("Webhook rifiutato: chiave segreta diversa da WEBHOOK_SECRET (controlla l'indicatore e ricrea l'alert)")
         return jsonify(ok=False, error="chiave errata"), 403
     accepted = 0
     for p in items:
