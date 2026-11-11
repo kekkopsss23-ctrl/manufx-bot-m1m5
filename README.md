@@ -21,7 +21,7 @@ Sl 4037
 - `SHOW_TF=on` aggiunge M1/M5 dopo il simbolo (utile se M1 e M5 vanno nello stesso topic).
 
 Differenze rispetto al bot principale:
-- niente filtro volatilità: M1 e M5 escono entrambi (si può riattivare con `FOLLOW_TFREC=on`)
+- filtro volatilità come nel bot principale: esce solo il timeframe consigliato dall'indicatore (M1 in volatilità, M5 a mercato calmo); con `FOLLOW_TFREC=off` escono sempre M1 e M5
 - si può dare un topic diverso a M1 e a M5 (`TOPIC_M1`, `TOPIC_M5`)
 - resta la regola "un solo setup per direzione" (`ONE_SIDE=on`): con un BUY aperto non esce un SELL sullo stesso simbolo
 

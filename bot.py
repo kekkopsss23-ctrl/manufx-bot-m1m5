@@ -15,8 +15,8 @@ Variabili d'ambiente:
   RECAP_TOPIC      (opzionale) topic del riepilogo giornaliero (default TOPIC_ID)
   WEBHOOK_SECRET   chiave segreta: la stessa scritta nell'indicatore (gruppo "Telegram Bot")
   TIMEFRAMES       timeframe pubblicati, default "1,5" (= M1 e M5)
-  FOLLOW_TFREC     on/off (default off): se on applica anche il filtro volatilita' dell'indicatore
-                   (pubblica solo il timeframe consigliato). Off = M1 e M5 sempre.
+  FOLLOW_TFREC     on/off (default on, come il bot principale): pubblica solo il timeframe consigliato
+                   dall'indicatore (M1 in volatilita', M5 a mercato calmo). Off = M1 e M5 sempre.
   ONE_SIDE         on/off (default on): niente zona opposta finche' un setup sullo stesso simbolo e' aperto
   TP1_CLOSE_PCT    % da chiudere a TP1 (default 70)
   CARD_EVENTS      eventi con immagine (default nessuno: solo testo; es. ZONE,TP,SL,CLOSE,RECAP)
@@ -61,7 +61,8 @@ TOPIC_BY_TF = {"1": _int_env("TOPIC_M1"), "5": _int_env("TOPIC_M5")}
 RECAP_TOPIC = _int_env("RECAP_TOPIC") or TOPIC_ID
 SECRET = os.environ.get("WEBHOOK_SECRET", "")
 TIMEFRAMES = {t.strip().upper() for t in os.environ.get("TIMEFRAMES", "1,5").split(",") if t.strip()}
-FOLLOW_TFREC = os.environ.get("FOLLOW_TFREC", "off").lower() == "on"
+# come il bot principale: pubblica solo il timeframe consigliato dall'indicatore (M1 in volatilita', M5 a mercato calmo)
+FOLLOW_TFREC = os.environ.get("FOLLOW_TFREC", os.environ.get("TF_FILTER", "on")).lower() == "on"
 ONE_SIDE = os.environ.get("ONE_SIDE", "on").lower() == "on"
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
@@ -370,17 +371,30 @@ def handle(p: dict) -> None:
     pre_key = f"{symbol}|{tf_raw}|PRE"
     side_in = (val(p, "side") or "").upper()
 
-    # 2) filtro volatilita' dell'indicatore: spento di default (M1 e M5 sempre)
+    # 2) filtro volatilita' dell'indicatore (come il bot principale)
     tfrec = (val(p, "tfrec") or "").upper()
     tf_ok = (not FOLLOW_TFREC) or (not tfrec) or tfrec == (tf_raw or "").upper()
+    def skip_zone(why: str):
+        # zona NON pubblicata: la segniamo, cosi' i suoi TP / stop successivi vengono scartati
+        log.info("Scartato %s %s %s %s: %s", ev, symbol, tf_raw, side_in, why)
+        if ev == "ZONE":
+            with state_lock:
+                trades[key] = {"skipped": True, "side": side_in, "open": False, "ts": time.time()}
+                trades.pop(pre_key, None)
+                save_state(trades)
+
     if ev in ("PRE", "ZONE") and not tf_ok:
+        skip_zone(f"timeframe consigliato {tfrec}")
         return
     # 3) un solo setup per direzione sullo stesso simbolo
     if ONE_SIDE and ev in ("PRE", "ZONE"):
         opp = open_opposite(symbol, tf_raw, side_in)
         if opp:
-            log.info("Scartato %s %s %s %s: setup %s ancora aperto (%s)", ev, symbol, tf_raw, side_in, opp.get("side"), opp.get("key"))
+            skip_zone(f"setup {opp.get('side')} ancora aperto ({opp.get('key')})")
             return
+    if ev in ("TP", "SL", "TSL", "CLOSE") and t.get("skipped"):
+        log.info("Scartato %s %s %s: zona %s non pubblicata", ev, symbol, tf_raw, val(p, "id"))
+        return
     # 4) aggiornamento di una zona sconosciuta (non pubblicata o server riavviato)
     if ev in ("TP", "SL", "TSL", "CLOSE") and not t:
         if ev == "TSL" or not tf_ok:
@@ -518,7 +532,7 @@ def recap_data(day: datetime | None = None) -> dict:
     rows = []
     for k, t in items:
         ts = t.get("ts")
-        if not ts:
+        if not ts or t.get("skipped"):
             continue
         born = datetime.fromtimestamp(ts, TZ)
         if born.date() != day.date():
@@ -612,12 +626,39 @@ def worker():
             jobs.task_done()
 
 
+def startup_check():
+    if not TOKEN or not CHAT_ID:
+        log.error("MANCANO TELEGRAM_TOKEN o CHAT_ID nelle variabili di Railway")
+        return
+    me = tg("getMe", {})
+    log.info("Bot Telegram: %s", ("@" + me["username"]) if me else "TOKEN NON VALIDO")
+    chat = tg("getChat", {"chat_id": CHAT_ID})
+    log.info("Gruppo: %s", chat.get("title") if chat else "CHAT_ID errato oppure il bot non e' nel gruppo")
+    if me and chat:
+        m = tg("getChatMember", {"chat_id": CHAT_ID, "user_id": me["id"]})
+        log.info("Ruolo del bot nel gruppo: %s", m.get("status") if m else "?")
+    log.info("Timeframe pubblicati: %s | topic generale %s, M1 %s, M5 %s | chiave webhook %s",
+             sorted(ALLOWED_TF), TOPIC_ID, TOPIC_BY_TF["1"], TOPIC_BY_TF["5"], "impostata" if SECRET else "VUOTA")
+
+
+threading.Thread(target=startup_check, daemon=True).start()
 threading.Thread(target=worker, daemon=True).start()
 if RECAP_TIME.strip():
     threading.Thread(target=recap_scheduler, daemon=True).start()
 
 
 # ---------------------------------------------------------------- endpoint
+@app.get("/stato")
+def stato():
+    """/stato?secret=...  ultime zone ricevute e se sono state pubblicate"""
+    if not _auth():
+        return jsonify(ok=False, error="chiave errata"), 403
+    with state_lock:
+        items = list(trades.items())[-20:]
+    return jsonify(ok=True, ultime=[{"zona": k, "pubblicata": not t.get("skipped"), "aperta": t.get("open"),
+                                     "lato": t.get("side")} for k, t in items])
+
+
 @app.get("/")
 def health():
     return jsonify(ok=True, bot="manufx-m1m5", timeframes=sorted(ALLOWED_TF), topic=TOPIC_ID,
@@ -628,6 +669,7 @@ def health():
 @app.post("/webhook")
 def webhook():
     raw = request.get_data(as_text=True) or ""
+    log.info("Webhook ricevuto: %s", raw[:300].replace(SECRET, "***") if SECRET else raw[:300])
     try:
         data = json.loads(raw)
         items = data if isinstance(data, list) else [data]
@@ -636,6 +678,7 @@ def webhook():
         # l'indicatore manda anche alert di solo testo (breakout, TP ecc.): qui non servono
         return jsonify(ok=True, ignored="non JSON"), 200
     if SECRET and any(p.get("secret") != SECRET for p in items):
+        log.warning("Webhook rifiutato: chiave segreta diversa da WEBHOOK_SECRET (controlla l'indicatore e ricrea l'alert)")
         return jsonify(ok=False, error="chiave errata"), 403
     accepted = 0
     for p in items:
