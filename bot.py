@@ -15,8 +15,8 @@ Variabili d'ambiente:
   RECAP_TOPIC      (opzionale) topic del riepilogo giornaliero (default TOPIC_ID)
   WEBHOOK_SECRET   chiave segreta: la stessa scritta nell'indicatore (gruppo "Telegram Bot")
   TIMEFRAMES       timeframe pubblicati, default "1,5" (= M1 e M5)
-  FOLLOW_TFREC     on/off (default off): se on applica anche il filtro volatilita' dell'indicatore
-                   (pubblica solo il timeframe consigliato). Off = M1 e M5 sempre.
+  FOLLOW_TFREC     on/off (default on, come il bot principale): pubblica solo il timeframe consigliato
+                   dall'indicatore (M1 in volatilita', M5 a mercato calmo). Off = M1 e M5 sempre.
   ONE_SIDE         on/off (default on): niente zona opposta finche' un setup sullo stesso simbolo e' aperto
   TP1_CLOSE_PCT    % da chiudere a TP1 (default 70)
   CARD_EVENTS      eventi con immagine (default nessuno: solo testo; es. ZONE,TP,SL,CLOSE,RECAP)
@@ -61,7 +61,8 @@ TOPIC_BY_TF = {"1": _int_env("TOPIC_M1"), "5": _int_env("TOPIC_M5")}
 RECAP_TOPIC = _int_env("RECAP_TOPIC") or TOPIC_ID
 SECRET = os.environ.get("WEBHOOK_SECRET", "")
 TIMEFRAMES = {t.strip().upper() for t in os.environ.get("TIMEFRAMES", "1,5").split(",") if t.strip()}
-FOLLOW_TFREC = os.environ.get("FOLLOW_TFREC", "off").lower() == "on"
+# come il bot principale: pubblica solo il timeframe consigliato dall'indicatore (M1 in volatilita', M5 a mercato calmo)
+FOLLOW_TFREC = os.environ.get("FOLLOW_TFREC", os.environ.get("TF_FILTER", "on")).lower() == "on"
 ONE_SIDE = os.environ.get("ONE_SIDE", "on").lower() == "on"
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
@@ -370,7 +371,7 @@ def handle(p: dict) -> None:
     pre_key = f"{symbol}|{tf_raw}|PRE"
     side_in = (val(p, "side") or "").upper()
 
-    # 2) filtro volatilita' dell'indicatore: spento di default (M1 e M5 sempre)
+    # 2) filtro volatilita' dell'indicatore (come il bot principale)
     tfrec = (val(p, "tfrec") or "").upper()
     tf_ok = (not FOLLOW_TFREC) or (not tfrec) or tfrec == (tf_raw or "").upper()
     def skip_zone(why: str):
